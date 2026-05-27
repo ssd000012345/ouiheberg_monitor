@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import shutil
+import socket
 import threading
 import subprocess
 import traceback
@@ -26,6 +27,9 @@ TG_CHAT_ID      = os.environ.get("TG_CHAT_ID", "").strip()
 WX_APP_TOKEN    = os.environ.get("WX_APP_TOKEN", "").strip()
 WX_UID          = os.environ.get("WX_UID", "").strip()
 ENABLE_RECORDING = os.environ.get("ENABLE_RECORDING", "false").strip().lower() == "true"
+
+# TCP 连通性检测：格式 "host:port"，例如 "88.151.197.15:8326"
+SERVER_HOST_PORT = os.environ.get("SERVER_HOST_PORT", "").strip()
 
 # Uptime Kuma 传入的心跳状态（status=0 离线，1 在线）
 _heartbeat_raw     = os.environ.get("UPTIME_HEARTBEAT", "").strip()
@@ -53,6 +57,121 @@ RECORDING_DIR.mkdir(exist_ok=True)
 def log(msg):  print(f"[INFO]  {msg}", flush=True)
 def warn(msg): print(f"[WARN]  {msg}", flush=True)
 def err(msg):  print(f"[ERROR] {msg}", flush=True)
+
+# ── TCP 连通性检测 ─────────────────────────────────────────
+def check_tcp(host: str, port: int, timeout: float = 5.0) -> bool:
+    """尝试 TCP 连接，返回 True 表示端口可达（服务器真正在线）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+def tcp_is_online() -> bool | None:
+    """
+    若配置了 SERVER_HOST_PORT 则进行 TCP 检测，返回 True/False。
+    未配置则返回 None（跳过 TCP 检测）。
+    """
+    if not SERVER_HOST_PORT:
+        return None
+    try:
+        host, port_str = SERVER_HOST_PORT.rsplit(":", 1)
+        port = int(port_str)
+    except ValueError:
+        warn(f"SERVER_HOST_PORT 格式错误（应为 host:port）: {SERVER_HOST_PORT}")
+        return None
+    result = check_tcp(host, port)
+    # 日志中隐藏真实地址
+    log(f"TCP 连通检测 [***:***]: {'✅ 可达' if result else '❌ 不可达'}")
+    return result
+
+# ── 敏感信息涂抹 ──────────────────────────────────────────
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+    warn("Pillow 未安装，截图涂抹功能不可用（pip install pillow）")
+
+# 需要涂抹的敏感字符串列表（运行时填充）
+_SENSITIVE_STRINGS: list[str] = []
+
+def _build_sensitive_list():
+    """收集所有敏感字符串（邮箱、IP、端口）。"""
+    items = []
+    if EMAIL:
+        items.append(EMAIL)
+        # 也单独加本地部分（@ 前）防止部分显示
+        local = EMAIL.split("@")[0]
+        if local:
+            items.append(local)
+    if SERVER_HOST_PORT:
+        items.append(SERVER_HOST_PORT)
+        # 单独加 IP 和端口
+        try:
+            host, port_str = SERVER_HOST_PORT.rsplit(":", 1)
+            items.append(host)
+            items.append(port_str)
+        except ValueError:
+            pass
+    return [s for s in items if s]
+
+def mask_screenshot(path: str) -> str:
+    """
+    对截图中的敏感文字区域进行黑色矩形涂抹。
+    使用 pytesseract OCR 定位文字位置；若 OCR 不可用则跳过。
+    同时对已知 UI 模式（邮箱行）进行区域涂抹。
+    返回处理后的文件路径（覆盖原文件）。
+    """
+    if not _PIL_AVAILABLE:
+        return path
+    if not _SENSITIVE_STRINGS:
+        return path
+
+    try:
+        img = Image.open(path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        # 尝试用 pytesseract 精准定位
+        try:
+            import pytesseract
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            n = len(data["text"])
+            for i in range(n):
+                word = (data["text"][i] or "").strip()
+                if not word:
+                    continue
+                for sensitive in _SENSITIVE_STRINGS:
+                    if word.lower() in sensitive.lower() or sensitive.lower() in word.lower():
+                        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+                        # 适当扩展涂抹范围
+                        pad = 4
+                        draw.rectangle([x - pad, y - pad, x + w + pad, y + h + pad], fill="black")
+                        break
+        except Exception:
+            # OCR 不可用时，对整行区域涂抹（保守策略）
+            pass
+
+        # ── 保守兜底：扫描图片中与敏感信息匹配的宽行区域 ──
+        # 对含有 @ 符号的邮箱，涂抹页面顶部可能出现账号的区域
+        # 这是一个启发式策略：登录后邮箱通常显示在固定位置
+        w_img, h_img = img.size
+        # 涂抹左侧边栏账号区（OuiPanel 布局：左上角头像+邮箱）
+        # 根据截图观察，账号信息大约在 y=250~290 区间
+        if EMAIL:
+            draw.rectangle([0, 240, 420, 300], fill=(20, 20, 20))  # 左侧面板账号行
+
+        # 涂抹控制台顶部标题中的邮箱（h6 class="modern-card-header-title"）
+        # 根据截图，Console: xxx@xxx.com 出现在控制台卡片标题处
+        # 大约在 y=335~365（基于 832px 高度截图）
+        draw.rectangle([440, 330, 980, 370], fill=(20, 20, 20))  # 控制台卡片标题行
+
+        img.save(path)
+        log(f"🔒 截图已涂抹敏感信息: {path}")
+    except Exception as e:
+        warn(f"截图涂抹失败: {e}")
+
+    return path
 
 # ── 推送通知 ──────────────────────────────────────────────
 def send_tg(text: str):
@@ -92,12 +211,13 @@ def notify(title: str, content: str):
     send_tg(f"{title}\n\n{content}")
     send_wx(title, content)
 
-# ── 截图 ──────────────────────────────────────────────────
+# ── 截图（含涂抹） ─────────────────────────────────────────
 def snap(sb, name: str) -> str | None:
     try:
         path = str(SCREENSHOT_DIR / f"{name}.png")
         sb.save_screenshot(path)
         log(f"截图: {path}")
+        mask_screenshot(path)  # 涂抹敏感信息
         return path
     except Exception as e:
         warn(f"截图失败: {e}")
@@ -128,6 +248,8 @@ class ScreenRecorder:
             try:
                 path = REC_FRAME_DIR / f"rec_{self._idx:04d}.png"
                 self.sb.save_screenshot(str(path))
+                # 录屏帧也做涂抹
+                mask_screenshot(str(path))
                 self._frames.append(path)
                 self._idx += 1
             except Exception:
@@ -283,6 +405,14 @@ def login(sb):
 
 # ── 读取电源状态 ───────────────────────────────────────────
 def get_power_status(sb) -> str:
+    """
+    综合判断服务器状态：
+    1. 优先使用 TCP 连通性检测（最可靠）
+    2. 检测页面按钮（Stop→running / Start→offline）
+    3. 检测 SVG 图标颜色/data-testid（StopCircleIcon→running，PlayCircleIcon→offline）
+    4. 检测控制台离线文案
+    只有以上多项一致指向 running 时才返回 running。
+    """
     console_url = f"{BASE_URL}/server/{SERVER_ID}/console"
     log(f"打开控制台: {console_url}")
     sb.uc_open_with_reconnect(console_url, reconnect_time=2)
@@ -297,7 +427,8 @@ def get_power_status(sb) -> str:
     time.sleep(1)
     snap(sb, "02-console")
 
-    status = sb.execute_script("""
+    # ── 方法1：按钮文本检测 ──────────────────────────────
+    btn_status = sb.execute_script("""
         var btns = document.querySelectorAll('button');
         var hasStart = false, hasStop = false;
         for (var i = 0; i < btns.length; i++) {
@@ -305,12 +436,86 @@ def get_power_status(sb) -> str:
             if (t === 'start')  hasStart = true;
             if (t === 'stop')   hasStop  = true;
         }
-        if (hasStop)  return 'running';
-        if (hasStart) return 'offline';
+        if (hasStop && !hasStart)  return 'running';
+        if (hasStart && !hasStop)  return 'offline';
+        if (hasStop && hasStart)   return 'ambiguous';
         return 'unknown';
     """)
-    log(f"电源状态: {status}")
-    return status or "unknown"
+
+    # ── 方法2：SVG 图标 data-testid 检测 ────────────────
+    # StopCircleIcon（红色圆形停止图标）= 服务器离线（可以停止）? 不对
+    # 根据截图分析：红色圆圈图标出现时服务器是 OFFLINE 状态
+    # OuiPanel 用 StopCircleIcon 表示"可以停止" = running
+    # PlayCircleIcon / 绿色播放图标 = 可以启动 = offline
+    icon_status = sb.execute_script("""
+        // 检测 data-testid
+        var stop_icon  = document.querySelector('[data-testid="StopCircleIcon"]');
+        var play_icon  = document.querySelector('[data-testid="PlayCircleIcon"]');
+        var start_icon = document.querySelector('[data-testid="PlayArrowIcon"]');
+
+        if (stop_icon && !play_icon && !start_icon) return 'running';
+        if ((play_icon || start_icon) && !stop_icon) return 'offline';
+
+        // 检测控制台卡片头部图标颜色（红色=停止中=offline，绿色=运行中）
+        var cardIcon = document.querySelector('.modern-card-header-icon svg, .card-header svg');
+        if (cardIcon) {
+            var fill = cardIcon.getAttribute('fill') || '';
+            var style = cardIcon.getAttribute('style') || '';
+            var color = cardIcon.style.color || '';
+            if (fill.includes('red') || fill.includes('#f') || color.includes('red')) return 'offline_icon';
+            if (fill.includes('green') || color.includes('green')) return 'running_icon';
+        }
+        return 'icon_unknown';
+    """)
+
+    # ── 方法3：控制台文案检测 ────────────────────────────
+    console_text_status = sb.execute_script("""
+        var consoleEl = document.querySelector('.xterm-rows, .console-output, pre, code');
+        var text = consoleEl ? consoleEl.innerText.toLowerCase() : document.body.innerText.toLowerCase();
+        if (text.includes('server is currently offline')) return 'offline';
+        if (text.includes('server is running') || text.includes('done') || text.includes('started')) return 'running';
+        return 'text_unknown';
+    """)
+
+    log(f"  按钮检测: {btn_status} | 图标检测: {icon_status} | 文案检测: {console_text_status}")
+
+    # ── 方法4：TCP 连通性检测（最终裁决） ────────────────
+    tcp_result = tcp_is_online()  # True / False / None
+
+    # ── 综合判断 ─────────────────────────────────────────
+    # TCP 检测结果最权威
+    if tcp_result is True:
+        log("✅ TCP 连通检测：端口可达，服务器在线")
+        final_status = "running"
+    elif tcp_result is False:
+        log("❌ TCP 连通检测：端口不可达，服务器离线")
+        final_status = "offline"
+    else:
+        # TCP 未配置，综合其他信号
+        offline_votes = sum([
+            btn_status in ("offline",),
+            icon_status in ("offline", "offline_icon"),
+            console_text_status in ("offline",),
+        ])
+        running_votes = sum([
+            btn_status in ("running",),
+            icon_status in ("running", "running_icon"),
+            console_text_status in ("running",),
+        ])
+
+        log(f"  投票结果 → 离线: {offline_votes} | 在线: {running_votes}")
+
+        if offline_votes > running_votes:
+            final_status = "offline"
+        elif running_votes > offline_votes:
+            final_status = "running"
+        else:
+            # 平票或全部未知：保守判定为 offline 以触发启动
+            warn("状态信号不明确，保守判定为 offline 以触发启动检查")
+            final_status = "offline"
+
+    log(f"电源状态: {final_status}")
+    return final_status
 
 # ── 点击 Start ─────────────────────────────────────────────
 def start_server(sb) -> bool:
@@ -345,14 +550,25 @@ def start_server(sb) -> bool:
 
 # ── 主流程 ────────────────────────────────────────────────
 def run():
+    global _SENSITIVE_STRINGS
+    _SENSITIVE_STRINGS = _build_sensitive_list()
+
     if not EMAIL or not PASSWORD:
         raise RuntimeError("缺少：OUIHEBERG_EMAIL 或 OUIHEBERG_PASSWORD")
     if not SERVER_ID:
         raise RuntimeError("缺少：OUIHEBERG_SERVER_ID")
 
     if UPTIME_STATUS == "up":
-        log("✅ Uptime Kuma 状态 UP，服务器已恢复，退出")
-        return
+        # 即使 Uptime Kuma 报告 UP，也用 TCP 二次确认
+        tcp_result = tcp_is_online()
+        if tcp_result is False:
+            warn("⚠️ Uptime Kuma 状态 UP 但 TCP 检测不可达，继续执行检查")
+        elif tcp_result is True:
+            log("✅ Uptime Kuma 状态 UP 且 TCP 可达，服务器已确认在线，退出")
+            return
+        else:
+            log("✅ Uptime Kuma 状态 UP，服务器已恢复，退出")
+            return
 
     log(f"▶ 检查服务器 [{SERVER_ID}]")
     if ENABLE_RECORDING:
@@ -394,12 +610,25 @@ def run():
                 time.sleep(5)
                 snap(sb, "03-after-start")
 
-                # 轮询确认上线（最多 3 分钟）
+                # 轮询确认上线（最多 3 分钟），TCP + 按钮双重确认
                 final = "unknown"
                 for i in range(18):
                     time.sleep(10)
                     sb.refresh()
                     time.sleep(4)
+
+                    # 先用 TCP 快速判断
+                    tcp_check = tcp_is_online()
+                    if tcp_check is True:
+                        final = "running"
+                        log(f"  等待上线 [{i+1}/18]: TCP 可达 → running")
+                        break
+                    elif tcp_check is False:
+                        final = "offline"
+                        log(f"  等待上线 [{i+1}/18]: TCP 不可达 → offline")
+                        continue
+
+                    # 无 TCP 配置时用按钮检测
                     final = sb.execute_script("""
                         var btns = document.querySelectorAll('button');
                         for (var i = 0; i < btns.length; i++) {
