@@ -55,22 +55,27 @@ jobs:
           sleep 2
           echo "Xvfb 已启动"
 
-      # ── 恢复上次缓存的浏览器 Cookie / Session ──────────────
-      - name: 恢复浏览器状态缓存（Cookie 持久化）
-        id: cache-browser-state
-        uses: actions/cache@v4
+      - name: 启用 Cloudflare WARP（绕过 IP 封锁）
+        uses: fscarmen/warp-on-actions@v1.3
         with:
-          path: browser_state
-          key: browser-state-${{ runner.os }}-ouiheberg
-          restore-keys: |
-            browser-state-${{ runner.os }}-ouiheberg
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+          echo "=== 出口 IP ==="
+          curl -s --max-time 10 https://api.ipify.org && echo
 
       - name: 打印触发信息
         run: |
           echo "触发方式：${{ github.event_name }}"
           echo "触发原因：${{ github.event.client_payload.reason || github.event.inputs.reason || 'Uptime Kuma server-down' }}"
           echo "录屏模式：${{ github.event.inputs.enable_recording || 'false' }}"
-          echo "Cookie 缓存命中：${{ steps.cache-browser-state.outputs.cache-hit }}"
 
       - name: 运行监控脚本
         env:
@@ -84,17 +89,9 @@ jobs:
           DISPLAY:            ":99"
           UPTIME_STATUS:      ${{ github.event.client_payload.status }}
           UPTIME_HEARTBEAT:   ${{ toJson(github.event.client_payload.heartbeat) }}
+          # 手动触发时读 inputs；webhook 触发时默认 false（不录屏）
           ENABLE_RECORDING:   ${{ github.event.inputs.enable_recording || 'false' }}
         run: python watchdog.py
-
-      # ── 保存浏览器 Cookie/Session 供下次复用 ───────────────
-      # 即使脚本失败也保存，避免丢失已登录的 Session
-      - name: 保存浏览器状态缓存
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: browser_state
-          key: browser-state-${{ runner.os }}-ouiheberg
 
       # ── 截图：不管成功还是失败都上传 ──────────────────────
       - name: 上传截图
