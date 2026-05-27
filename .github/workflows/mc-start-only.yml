@@ -1,0 +1,126 @@
+name: 🚨 服务器离线紧急启动（Uptime Kuma 触发）
+
+on:
+  repository_dispatch:
+    types: [server-down]   # Uptime Kuma webhook 里 event_type 填这个
+  workflow_dispatch:        # 手动触发，方便测试
+    inputs:
+      enable_recording:
+        description: '🎬 启用录屏（true=录屏，false=仅截图）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      reason:
+        description: '手动触发原因（备注）'
+        required: false
+        default: '手动测试'
+
+jobs:
+  restart:
+    name: 检测状态并启动服务器
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 SeleniumBase
+        run: pip install seleniumbase
+
+      - name: 安装系统依赖（Chrome + Xvfb + ffmpeg）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libglib2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+            libxss1 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libgbm1 \
+            fonts-liberation xvfb ffmpeg
+          ffmpeg -version | head -1
+
+      - name: 启动虚拟显示（Xvfb）
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+          echo "Xvfb 已启动"
+
+      - name: 启用 Cloudflare WARP（绕过 IP 封锁）
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+          echo "=== 出口 IP ==="
+          curl -s --max-time 10 https://api.ipify.org && echo
+
+      - name: 打印触发信息
+        run: |
+          echo "触发方式：${{ github.event_name }}"
+          echo "触发原因：${{ github.event.client_payload.reason || github.event.inputs.reason || 'Uptime Kuma server-down' }}"
+          echo "录屏模式：${{ github.event.inputs.enable_recording || 'false' }}"
+
+      - name: 运行监控脚本
+        env:
+          OUIHEBERG_EMAIL:    ${{ secrets.OUIHEBERG_EMAIL }}
+          OUIHEBERG_PASSWORD: ${{ secrets.OUIHEBERG_PASSWORD }}
+          OUIHEBERG_SERVER_ID: ${{ secrets.OUIHEBERG_SERVER_ID }}
+          TG_BOT_TOKEN:       ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+          WX_APP_TOKEN:       ${{ secrets.WX_APP_TOKEN }}
+          WX_UID:             ${{ secrets.WX_UID }}
+          DISPLAY:            ":99"
+          UPTIME_STATUS:      ${{ github.event.client_payload.status }}
+          UPTIME_HEARTBEAT:   ${{ toJson(github.event.client_payload.heartbeat) }}
+          # 手动触发时读 inputs；webhook 触发时默认 false（不录屏）
+          ENABLE_RECORDING:   ${{ github.event.inputs.enable_recording || 'false' }}
+        run: python watchdog.py
+
+      # ── 截图：不管成功还是失败都上传 ──────────────────────
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: |
+            screenshots/
+            !screenshots/rec/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── 录屏：不管成功还是失败都上传（没有文件时静默跳过）──
+      - name: 上传录屏
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_number }}
+          path: recordings/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 清理旧运行记录（只保留最新 3 条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
