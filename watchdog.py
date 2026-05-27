@@ -3,6 +3,11 @@
 OuiHeberg / OuiPanel 服务器自动启动脚本
 功能：登录 OuiHeberg OAuth → 检测服务器状态 → 离线则点 Start
 触发：Uptime Kuma 检测到离线时通过 webhook 触发 GitHub Actions
+
+新增：
+  - Cookie 自动持久化（browser_state/selenium_profile）
+  - Cookie 失效时自动回退重新登录
+  - 敏感信息 mask() 脱敏输出
 """
 
 import os
@@ -42,12 +47,27 @@ except Exception:
 
 BASE_URL = "https://dash.ouipanel.com"
 
+# ── Cookie 持久化路径 ──────────────────────────────────────
+STATE_DIR      = Path("browser_state")
+USER_DATA_DIR  = str((STATE_DIR / "selenium_profile").resolve())
+STATE_DIR.mkdir(exist_ok=True)
+
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 REC_FRAME_DIR  = Path("screenshots/rec")
 REC_FRAME_DIR.mkdir(exist_ok=True)
 RECORDING_DIR  = Path("recordings")
 RECORDING_DIR.mkdir(exist_ok=True)
+
+# ── 敏感信息脱敏 ──────────────────────────────────────────
+def mask(value: str, keep: int = 3) -> str:
+    """将敏感字符串脱敏：保留前 keep 位，其余替换为 ***"""
+    if not value:
+        return "***"
+    if "@" in value:
+        local, domain = value.split("@", 1)
+        return f"{local[:keep]}***@{domain}"
+    return f"{value[:keep]}***"
 
 # ── 日志 ──────────────────────────────────────────────────
 def log(msg):  print(f"[INFO]  {msg}", flush=True)
@@ -189,8 +209,26 @@ def wait_for_url(sb, keyword: str, timeout: int = 20) -> bool:
         time.sleep(0.5)
     return False
 
-# ── 登录 OuiHeberg OAuth ──────────────────────────────────
-def login(sb):
+# ── 检测是否已登录 ─────────────────────────────────────────
+def is_logged_in(sb) -> bool:
+    """
+    访问 dashboard 首页，若未被重定向到 /login 则视为已登录（Cookie 有效）。
+    """
+    try:
+        sb.uc_open_with_reconnect(f"{BASE_URL}/dashboard", reconnect_time=3)
+        time.sleep(3)
+        cur = sb.get_current_url()
+        if "/login" in cur or "manager.ouiheberg.com" in cur:
+            return False
+        if "dash.ouipanel.com" in cur:
+            return True
+    except Exception as e:
+        warn(f"检测登录状态异常: {e}")
+    return False
+
+# ── 执行登录（填写账号密码）─────────────────────────────────
+def do_login(sb):
+    """打开登录页并填写凭据完成登录，不含 Cookie 检测逻辑。"""
     log("打开 OuiPanel 登录页...")
     sb.uc_open_with_reconnect(f"{BASE_URL}/login", reconnect_time=3)
     time.sleep(3)
@@ -239,7 +277,7 @@ def login(sb):
         snap(sb, "oauth-redirect-failed")
         raise RuntimeError(f"未跳转到 OAuth 页，当前: {sb.get_current_url()}")
 
-    log("填写邮箱和密码...")
+    log(f"填写邮箱: {mask(EMAIL)} ...")
     time.sleep(2)
 
     try:
@@ -281,10 +319,35 @@ def login(sb):
     log(f"✅ 登录成功！当前: {sb.get_current_url()}")
     snap(sb, "01-after-login")
 
+# ── 登录入口：Cookie 优先，失效则回退重新登录 ──────────────
+def login(sb):
+    """
+    Cookie 持久化登录策略：
+    1. 若 user_data_dir 中存有上次 Session，先检测是否仍然有效；
+    2. 有效 → 直接跳过登录；
+    3. 无效（Cookie 失效 / 首次运行）→ 执行账号密码登录。
+    登录成功后浏览器 profile 会自动保存 Cookie，下次复用。
+    """
+    log(f"📂 浏览器状态目录: {USER_DATA_DIR}")
+    profile_exists = Path(USER_DATA_DIR).exists()
+
+    if profile_exists:
+        log("🍪 检测已有 Cookie，尝试免登录...")
+        if is_logged_in(sb):
+            log("✅ Cookie 有效，已免登录")
+            snap(sb, "01-cookie-login-ok")
+            return
+        else:
+            warn("⚠️  Cookie 已失效，回退账号密码登录...")
+    else:
+        log("🔑 首次运行，执行账号密码登录...")
+
+    do_login(sb)
+
 # ── 读取电源状态 ───────────────────────────────────────────
 def get_power_status(sb) -> str:
     console_url = f"{BASE_URL}/server/{SERVER_ID}/console"
-    log(f"打开控制台: {console_url}")
+    log(f"打开控制台 (server={mask(SERVER_ID)})...")
     sb.uc_open_with_reconnect(console_url, reconnect_time=2)
     time.sleep(5)
 
@@ -354,7 +417,7 @@ def run():
         log("✅ Uptime Kuma 状态 UP，服务器已恢复，退出")
         return
 
-    log(f"▶ 检查服务器 [{SERVER_ID}]")
+    log(f"▶ 检查服务器 [{mask(SERVER_ID)}]  账号: {mask(EMAIL)}")
     if ENABLE_RECORDING:
         log("🎬 录屏已启用")
     else:
@@ -364,6 +427,7 @@ def run():
         uc=True,
         headless=False,
         undetectable=True,
+        user_data_dir=USER_DATA_DIR,          # ← Cookie 持久化
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     )
 
@@ -372,6 +436,7 @@ def run():
         recorder.start()
 
         try:
+            # 登录（Cookie 优先，失效自动回退重新登录）
             login(sb)
 
             power = get_power_status(sb)
@@ -388,7 +453,7 @@ def run():
                 ok = start_server(sb)
                 if not ok:
                     notify("❌ OuiHeberg 启动失败",
-                           f"服务器 {SERVER_ID} 离线，但未找到 Start 按钮，请手动处理。")
+                           f"服务器离线，但未找到 Start 按钮，请手动处理。")
                     return
 
                 time.sleep(5)
@@ -417,7 +482,7 @@ def run():
                 if final == "running":
                     log("✅ 服务器已上线")
                     notify("🚀 OuiHeberg 服务器已上线",
-                           f"服务器 {SERVER_ID} 检测到离线，已自动执行 Start，现已 ONLINE。")
+                           "检测到离线，已自动执行 Start，现已 ONLINE。")
                 else:
                     log(f"⚠️ 启动后状态为 {final}，请手动确认")
                     notify("⚠️ OuiHeberg 服务器启动中",
