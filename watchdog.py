@@ -27,20 +27,15 @@ TG_CHAT_ID      = os.environ.get("TG_CHAT_ID", "").strip()
 WX_APP_TOKEN    = os.environ.get("WX_APP_TOKEN", "").strip()
 WX_UID          = os.environ.get("WX_UID", "").strip()
 ENABLE_RECORDING = os.environ.get("ENABLE_RECORDING", "false").strip().lower() == "true"
-
-# TCP 连通性检测：格式 "host:port"，例如 "88.151.197.15:8326"
 SERVER_HOST_PORT = os.environ.get("SERVER_HOST_PORT", "").strip()
 
-# Uptime Kuma 传入的心跳状态（status=0 离线，1 在线）
 _heartbeat_raw     = os.environ.get("UPTIME_HEARTBEAT", "").strip()
 _uptime_status_raw = os.environ.get("UPTIME_STATUS", "").strip().lower()
 try:
     _hb = json.loads(_heartbeat_raw) if _heartbeat_raw else {}
     UPTIME_STATUS = str(_hb.get("status", _uptime_status_raw)).lower()
-    if UPTIME_STATUS == "1":
-        UPTIME_STATUS = "up"
-    elif UPTIME_STATUS == "0":
-        UPTIME_STATUS = "down"
+    if UPTIME_STATUS == "1":  UPTIME_STATUS = "up"
+    elif UPTIME_STATUS == "0": UPTIME_STATUS = "down"
 except Exception:
     UPTIME_STATUS = _uptime_status_raw
 
@@ -58,9 +53,8 @@ def log(msg):  print(f"[INFO]  {msg}", flush=True)
 def warn(msg): print(f"[WARN]  {msg}", flush=True)
 def err(msg):  print(f"[ERROR] {msg}", flush=True)
 
-# ── TCP 连通性检测 ─────────────────────────────────────────
+# ── TCP 连통检测 ───────────────────────────────────────────
 def check_tcp(host: str, port: int, timeout: float = 5.0) -> bool:
-    """尝试 TCP 连接，返回 True 表示端口可达（服务器真正在线）。"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -68,30 +62,19 @@ def check_tcp(host: str, port: int, timeout: float = 5.0) -> bool:
         return False
 
 def tcp_is_online() -> bool | None:
-    """
-    若配置了 SERVER_HOST_PORT 则进行 TCP 检测，返回 True/False。
-    未配置则返回 None（跳过 TCP 检测）。
-    """
     if not SERVER_HOST_PORT:
         return None
     try:
         host, port_str = SERVER_HOST_PORT.rsplit(":", 1)
         port = int(port_str)
     except ValueError:
-        warn(f"SERVER_HOST_PORT 格式错误（应为 host:port）: [已隐藏]")
+        warn("SERVER_HOST_PORT 格式错误（应为 host:port）")
         return None
     result = check_tcp(host, port)
     log(f"TCP 连通检测 [***:***]: {'✅ 可达' if result else '❌ 不可达'}")
     return result
 
-# ── 敏感信息涂抹 ──────────────────────────────────────────
-try:
-    from PIL import Image, ImageDraw
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-    warn("Pillow 未安装，截图涂抹功能不可用（pip install pillow）")
-
+# ── 敏感信息收集 ──────────────────────────────────────────
 _SENSITIVE_STRINGS: list[str] = []
 
 def _build_sensitive_list():
@@ -111,56 +94,117 @@ def _build_sensitive_list():
             pass
     return [s for s in items if s]
 
-def mask_screenshot(path: str) -> str:
+# ── JS注入：截图前在浏览器内遮盖敏感文字 ──────────────────
+def inject_redaction(sb):
     """
-    对截图中的敏感信息区域进行黑色矩形涂抹。
-    涂抹策略：
-    1. pytesseract OCR 精准定位（可用时）
-    2. 固定区域兜底（基于 OuiPanel 已知布局）
+    在页面中找到所有包含敏感信息的文本节点，
+    用黑色 overlay div 覆盖，截图后再移除。
+    这是最可靠的方案——直接在渲染层遮盖，不依赖像素坐标。
     """
-    if not _PIL_AVAILABLE:
-        return path
+    if not _SENSITIVE_STRINGS:
+        return
+
+    sensitive_json = json.dumps(_SENSITIVE_STRINGS)
+    sb.execute_script(f"""
+        (function() {{
+            var sensitiveList = {sensitive_json};
+            var overlays = [];
+
+            function addOverlay(rect) {{
+                var d = document.createElement('div');
+                d.setAttribute('data-redact', 'true');
+                d.style.cssText = [
+                    'position:fixed',
+                    'left:' + rect.left + 'px',
+                    'top:' + rect.top + 'px',
+                    'width:' + (rect.width + 8) + 'px',
+                    'height:' + (rect.height + 4) + 'px',
+                    'background:#111',
+                    'z-index:2147483647',
+                    'pointer-events:none'
+                ].join(';');
+                document.body.appendChild(d);
+                overlays.push(d);
+            }}
+
+            // 遍历所有文本节点，找包含敏感词的
+            var walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                null
+            );
+            var node;
+            while (node = walker.nextNode()) {{
+                var text = node.nodeValue || '';
+                var hit = sensitiveList.some(function(s) {{
+                    return s && text.toLowerCase().includes(s.toLowerCase());
+                }});
+                if (!hit) continue;
+                var range = document.createRange();
+                range.selectNode(node);
+                var rects = range.getClientRects();
+                for (var i = 0; i < rects.length; i++) {{
+                    var r = rects[i];
+                    if (r.width > 0 && r.height > 0) {{
+                        addOverlay(r);
+                    }}
+                }}
+            }}
+
+            // 额外：直接定位已知含敏感信息的元素
+            var selectors = [
+                'h6.modern-card-header-title',   // Console: xxx@xxx.com
+                '.simplebar-content h6',          // 侧边栏账号名
+                '.connection-info',               // Connection information
+                '[class*="server-address"]',      // 服务器地址行
+                '.card-body .text-muted'          // 可能含IP的文本
+            ];
+            selectors.forEach(function(sel) {{
+                document.querySelectorAll(sel).forEach(function(el) {{
+                    var text = el.innerText || '';
+                    var hit = sensitiveList.some(function(s) {{
+                        return s && text.toLowerCase().includes(s.toLowerCase());
+                    }});
+                    if (hit) {{
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width > 0) addOverlay(rect);
+                    }}
+                }});
+            }});
+
+            window.__redactOverlays = overlays;
+        }})();
+    """)
+    time.sleep(0.1)  # 等 overlay 渲染
+
+def remove_redaction(sb):
+    """移除之前注入的遮盖层。"""
     try:
-        img = Image.open(path).convert("RGB")
-        draw = ImageDraw.Draw(img)
-        w_img, h_img = img.size
+        sb.execute_script("""
+            (document.querySelectorAll('[data-redact="true"]') || [])
+                .forEach(function(d){ d.remove(); });
+            window.__redactOverlays = [];
+        """)
+    except Exception:
+        pass
 
-        # ── OCR 精准定位 ──────────────────────────────────
-        try:
-            import pytesseract
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-            n = len(data["text"])
-            for i in range(n):
-                word = (data["text"][i] or "").strip()
-                if not word:
-                    continue
-                for sensitive in _SENSITIVE_STRINGS:
-                    if word.lower() in sensitive.lower() or sensitive.lower() in word.lower():
-                        x, y, ww, hh = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-                        pad = 6
-                        draw.rectangle([x - pad, y - pad, x + ww + pad, y + hh + pad], fill="black")
-                        break
-        except Exception:
-            pass
-
-        # ── 固定区域兜底涂抹（OuiPanel 布局） ─────────────
-        # 左侧面板：账号邮箱显示行（约 y=250~290，全宽左列）
-        draw.rectangle([0, 240, 400, 300], fill=(15, 15, 15))
-
-        # 控制台卡片标题 "Console: xxx@xxx.com"
-        # 基于 1280px 宽截图，卡片大约在左侧面板右边
-        draw.rectangle([430, 328, 980, 368], fill=(15, 15, 15))
-
-        # Connection information 区域（底部 IP 地址行）
-        # "Encrypted IP: xx.xx.xx.xx:port" 和 "IP Alias: xxx.ouiheberg.com:port"
-        # 根据截图，Connection info 在左侧面板下方，大约 y=780~860
-        draw.rectangle([0, 770, 400, 870], fill=(15, 15, 15))
-
-        img.save(path)
-        log(f"🔒 截图已涂抹敏感信息: {path}")
+# ── 截图：注入遮盖 → 截图 → 移除遮盖（录屏帧不处理）──────
+def snap(sb, name: str) -> str | None:
+    """
+    截取关键截图，截图前用 JS 覆盖敏感信息，截后恢复页面。
+    只有命名截图（01/02/03/04）才做遮盖，录屏帧不处理。
+    """
+    try:
+        path = str(SCREENSHOT_DIR / f"{name}.png")
+        inject_redaction(sb)
+        sb.save_screenshot(path)
+        remove_redaction(sb)
+        log(f"截图: {path}")
+        return path
     except Exception as e:
-        warn(f"截图涂抹失败: {e}")
-    return path
+        remove_redaction(sb)
+        warn(f"截图失败: {e}")
+        return None
 
 # ── 推送通知 ──────────────────────────────────────────────
 def send_tg(text: str):
@@ -200,19 +244,7 @@ def notify(title: str, content: str):
     send_tg(f"{title}\n\n{content}")
     send_wx(title, content)
 
-# ── 截图（含涂抹） ─────────────────────────────────────────
-def snap(sb, name: str) -> str | None:
-    try:
-        path = str(SCREENSHOT_DIR / f"{name}.png")
-        sb.save_screenshot(path)
-        log(f"截图: {path}")
-        mask_screenshot(path)
-        return path
-    except Exception as e:
-        warn(f"截图失败: {e}")
-        return None
-
-# ── 录屏 ──────────────────────────────────────────────────
+# ── 录屏（帧不做任何涂抹处理）────────────────────────────
 class ScreenRecorder:
     def __init__(self, sb, interval: float = 2.0):
         self.sb       = sb
@@ -235,7 +267,6 @@ class ScreenRecorder:
             try:
                 path = REC_FRAME_DIR / f"rec_{self._idx:04d}.png"
                 self.sb.save_screenshot(str(path))
-                mask_screenshot(str(path))
                 self._frames.append(path)
                 self._idx += 1
             except Exception:
@@ -255,7 +286,7 @@ class ScreenRecorder:
 
     def _compile(self, output_name: str) -> str | None:
         if not shutil.which("ffmpeg"):
-            warn("ffmpeg 未安装，跳过视频合成（帧已保留在 screenshots/rec/）")
+            warn("ffmpeg 未安装，跳过视频合成")
             return None
         concat_file = RECORDING_DIR / "frames.txt"
         with open(concat_file, "w") as f:
@@ -305,11 +336,7 @@ def login(sb):
 
     log("点击 OuiHeberg 登录按钮...")
     clicked = False
-    for sel in [
-        'button:contains("OuiHeberg")',
-        'a:contains("OuiHeberg")',
-        'button:contains("Connexion")',
-    ]:
+    for sel in ['button:contains("OuiHeberg")', 'a:contains("OuiHeberg")', 'button:contains("Connexion")']:
         try:
             if sb.is_element_visible(sel):
                 sb.uc_click(sel)
@@ -385,22 +412,13 @@ def login(sb):
     log(f"✅ 登录成功！当前: {sb.get_current_url()}")
     snap(sb, "01-after-login")
 
-# ── 读取电源状态（精准版） ─────────────────────────────────
+# ── 读取电源状态 ───────────────────────────────────────────
 def get_power_status(sb) -> str:
-    """
-    综合判断服务器状态。检测优先级：
-    1. TCP 连通检测（最可靠）
-    2. 按钮 disabled 属性（OuiPanel 精准标志）
-       - btn-outline-success 不带 disabled  → 可点 Start → offline
-       - btn-outline-danger  不带 disabled  → 可点 Stop  → running
-    3. 控制台离线文案
-    """
     console_url = f"{BASE_URL}/server/{SERVER_ID}/console"
     log(f"打开控制台: {console_url}")
     sb.uc_open_with_reconnect(console_url, reconnect_time=2)
     time.sleep(5)
 
-    # 关闭弹窗
     sb.execute_script("""
         document.querySelectorAll('button').forEach(function(b){
             var t=(b.innerText||'').trim().toLowerCase();
@@ -410,23 +428,8 @@ def get_power_status(sb) -> str:
     time.sleep(1)
     snap(sb, "02-console")
 
-    # ── 方法1：精准按钮 disabled 属性检测 ──────────────────
-    # OuiPanel 布局：
-    #   btn-outline-success = Start（绿色）
-    #   btn-outline-danger  = Stop （红色）
-    #   btn-outline-warning = Restart
-    #   btn-outline-secondary = Force stop
-    # 服务器 running 时：Stop 可用，Start/Restart/Force stop disabled
-    # 服务器 offline 时：Start 可用，Stop/Restart/Force stop disabled
+    # 精准按钮检测（class + text + disabled）
     btn_status = sb.execute_script("""
-        var startBtn = document.querySelector(
-            'button.btn-outline-success:not([disabled]), button.btn-outline-success:not(.disabled)'
-        );
-        var stopBtn = document.querySelector(
-            'button.btn-outline-danger:not([disabled]), button.btn-outline-danger:not(.disabled)'
-        );
-
-        // 同时检查按钮文字确认是 Start/Stop
         var startActive = false, stopActive = false;
         document.querySelectorAll('button').forEach(function(b) {
             var txt = (b.innerText || b.textContent || '').trim().toLowerCase();
@@ -435,14 +438,12 @@ def get_power_status(sb) -> str:
             if (txt === 'start' && cls.includes('btn-outline-success') && !dis) startActive = true;
             if (txt === 'stop'  && cls.includes('btn-outline-danger')  && !dis) stopActive  = true;
         });
-
         if (stopActive  && !startActive) return 'running';
         if (startActive && !stopActive)  return 'offline';
         if (stopActive  && startActive)  return 'ambiguous';
         return 'unknown';
     """)
 
-    # ── 方法2：控制台文案检测 ────────────────────────────
     console_text_status = sb.execute_script("""
         var text = document.body.innerText.toLowerCase();
         if (text.includes('server is currently offline')) return 'offline';
@@ -452,60 +453,41 @@ def get_power_status(sb) -> str:
 
     log(f"  按钮检测: {btn_status} | 文案检测: {console_text_status}")
 
-    # ── 方法3：TCP 连通性检测（最终裁决） ────────────────
     tcp_result = tcp_is_online()
-
     if tcp_result is True:
-        log("✅ TCP 连通：端口可达 → running")
+        log("✅ TCP：端口可达 → running")
         return "running"
     elif tcp_result is False:
-        log("❌ TCP 连通：端口不可达 → offline")
+        log("❌ TCP：端口不可达 → offline")
         return "offline"
 
-    # TCP 未配置时按投票决定
-    offline_votes = sum([
-        btn_status == "offline",
-        console_text_status == "offline",
-    ])
-    running_votes = sum([
-        btn_status == "running",
-        console_text_status == "running",
-    ])
-
+    offline_votes = sum([btn_status == "offline", console_text_status == "offline"])
+    running_votes = sum([btn_status == "running", console_text_status == "running"])
     log(f"  投票 → 离线: {offline_votes} | 在线: {running_votes}")
 
-    if offline_votes > running_votes:
-        return "offline"
-    elif running_votes > offline_votes:
-        return "running"
-    else:
-        warn("状态信号不明确，保守判定为 offline")
-        return "offline"
+    if offline_votes > running_votes:  return "offline"
+    if running_votes > offline_votes:  return "running"
+    warn("状态信号不明确，保守判定为 offline")
+    return "offline"
 
-# ── 点击 Start（精准版） ───────────────────────────────────
+# ── 点击 Start ─────────────────────────────────────────────
 def start_server(sb) -> bool:
     log("点击 Start 按钮...")
-
-    # 优先用精准 CSS selector（class + 文字 + 非 disabled）
     r = sb.execute_script("""
         var found = null;
         document.querySelectorAll('button').forEach(function(b) {
             var txt = (b.innerText || b.textContent || '').trim().toLowerCase();
             var cls = b.className || '';
             var dis = b.disabled || b.classList.contains('disabled');
-            if (txt === 'start' && cls.includes('btn-outline-success') && !dis) {
-                found = b;
-            }
+            if (txt === 'start' && cls.includes('btn-outline-success') && !dis) found = b;
         });
         if (found) { found.click(); return 'clicked:' + found.className; }
         return 'not_found';
     """)
-
     if "not_found" not in str(r):
         log(f"✅ JS 精准点击 Start: {r}")
         return True
 
-    # 兜底：SeleniumBase 文字定位
     for sel in ['button:contains("Start")', '.btn-outline-success']:
         try:
             if sb.is_element_visible(sel):
@@ -532,7 +514,7 @@ def run():
     if UPTIME_STATUS == "up":
         tcp_result = tcp_is_online()
         if tcp_result is False:
-            warn("⚠️ Uptime Kuma 状态 UP 但 TCP 检测不可达，继续执行检查")
+            warn("⚠️ Uptime Kuma 状态 UP 但 TCP 不可达，继续执行检查")
         elif tcp_result is True:
             log("✅ Uptime Kuma UP 且 TCP 可达，确认在线，退出")
             return
@@ -540,11 +522,8 @@ def run():
             log("✅ Uptime Kuma 状态 UP，退出")
             return
 
-    log(f"▶ 检查服务器 [***]")
-    if ENABLE_RECORDING:
-        log("🎬 录屏已启用")
-    else:
-        log("📷 仅截图模式")
+    log("▶ 检查服务器 [***]")
+    log("🎬 录屏已启用" if ENABLE_RECORDING else "📷 仅截图模式")
 
     driver = Driver(
         uc=True,
@@ -572,21 +551,18 @@ def run():
 
                 ok = start_server(sb)
                 if not ok:
-                    notify("❌ OuiHeberg 启动失败",
-                           f"服务器离线，但未找到 Start 按钮，请手动处理。")
+                    notify("❌ OuiHeberg 启动失败", "服务器离线，但未找到 Start 按钮，请手动处理。")
                     return
 
                 time.sleep(5)
                 snap(sb, "03-after-start")
 
-                # 轮询确认上线（最多 3 分钟）
                 final = "unknown"
                 for i in range(18):
                     time.sleep(10)
                     sb.refresh()
                     time.sleep(4)
 
-                    # TCP 优先
                     tcp_check = tcp_is_online()
                     if tcp_check is True:
                         final = "running"
@@ -597,15 +573,14 @@ def run():
                         log(f"  等待上线 [{i+1}/18]: TCP 不可达")
                         continue
 
-                    # 无 TCP 时用按钮检测
                     final = sb.execute_script("""
                         var startActive = false, stopActive = false;
                         document.querySelectorAll('button').forEach(function(b) {
                             var txt = (b.innerText||'').trim().toLowerCase();
                             var cls = b.className || '';
                             var dis = b.disabled || b.classList.contains('disabled');
-                            if (txt === 'start' && cls.includes('btn-outline-success') && !dis) startActive = true;
-                            if (txt === 'stop'  && cls.includes('btn-outline-danger')  && !dis) stopActive  = true;
+                            if (txt==='start' && cls.includes('btn-outline-success') && !dis) startActive=true;
+                            if (txt==='stop'  && cls.includes('btn-outline-danger')  && !dis) stopActive=true;
                         });
                         if (stopActive && !startActive) return 'running';
                         if (startActive && !stopActive) return 'offline';
@@ -618,12 +593,10 @@ def run():
                 snap(sb, "04-final")
                 if final == "running":
                     log("✅ 服务器已上线")
-                    notify("🚀 OuiHeberg 服务器已上线",
-                           f"服务器检测到离线，已自动执行 Start，现已 ONLINE。")
+                    notify("🚀 OuiHeberg 服务器已上线", "服务器检测到离线，已自动执行 Start，现已 ONLINE。")
                 else:
                     log(f"⚠️ 启动后状态为 {final}，请手动确认")
-                    notify("⚠️ OuiHeberg 服务器启动中",
-                           f"已发送 Start 指令，当前状态：{final}，请稍后手动确认。")
+                    notify("⚠️ OuiHeberg 服务器启动中", f"已发送 Start 指令，当前状态：{final}，请稍后手动确认。")
 
         except Exception as e:
             err(f"异常: {e}")
