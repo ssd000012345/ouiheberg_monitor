@@ -3,12 +3,6 @@
 OuiHeberg / OuiPanel 服务器自动启动脚本
 功能：登录 OuiHeberg OAuth → 检测服务器状态 → 离线则点 Start
 触发：Uptime Kuma 检测到离线时通过 webhook 触发 GitHub Actions
-
-特性：
-  - Cookie 自动持久化（browser_state/selenium_profile）
-  - Cookie 失效时自动回退重新登录
-  - 敏感信息 mask() 脱敏输出
-  - OAuth 流程完整等待 + Cloudflare 绕过
 """
 
 import os
@@ -46,13 +40,7 @@ try:
 except Exception:
     UPTIME_STATUS = _uptime_status_raw
 
-BASE_URL     = "https://dash.ouipanel.com"
-OAUTH_DOMAIN = "manager.ouiheberg.com"
-
-# ── Cookie 持久化路径 ──────────────────────────────────────
-STATE_DIR     = Path("browser_state")
-USER_DATA_DIR = str((STATE_DIR / "selenium_profile").resolve())
-STATE_DIR.mkdir(exist_ok=True)
+BASE_URL = "https://dash.ouipanel.com"
 
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -60,16 +48,6 @@ REC_FRAME_DIR  = Path("screenshots/rec")
 REC_FRAME_DIR.mkdir(exist_ok=True)
 RECORDING_DIR  = Path("recordings")
 RECORDING_DIR.mkdir(exist_ok=True)
-
-# ── 敏感信息脱敏 ──────────────────────────────────────────
-def mask(value: str, keep: int = 3) -> str:
-    """将敏感字符串脱敏：保留前 keep 位，其余替换为 ***"""
-    if not value:
-        return "***"
-    if "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[:keep]}***@{domain}"
-    return f"{value[:keep]}***"
 
 # ── 日志 ──────────────────────────────────────────────────
 def log(msg):  print(f"[INFO]  {msg}", flush=True)
@@ -119,7 +97,7 @@ def snap(sb, name: str) -> str | None:
     try:
         path = str(SCREENSHOT_DIR / f"{name}.png")
         sb.save_screenshot(path)
-        log(f"截图: {path} | URL: {sb.get_current_url()}")
+        log(f"截图: {path}")
         return path
     except Exception as e:
         warn(f"截图失败: {e}")
@@ -127,6 +105,8 @@ def snap(sb, name: str) -> str | None:
 
 # ── 录屏 ──────────────────────────────────────────────────
 class ScreenRecorder:
+    """每 N 秒截一帧，结束后用 ffmpeg 合成 MP4。"""
+
     def __init__(self, sb, interval: float = 2.0):
         self.sb       = sb
         self.interval = interval
@@ -167,8 +147,9 @@ class ScreenRecorder:
 
     def _compile(self, output_name: str) -> str | None:
         if not shutil.which("ffmpeg"):
-            warn("ffmpeg 未安装，跳过视频合成")
+            warn("ffmpeg 未安装，跳过视频合成（帧已保留在 screenshots/rec/）")
             return None
+
         concat_file = RECORDING_DIR / "frames.txt"
         with open(concat_file, "w") as f:
             for p in self._frames:
@@ -176,11 +157,17 @@ class ScreenRecorder:
                 f.write(f"duration {self.interval}\n")
             if self._frames:
                 f.write(f"file '{self._frames[-1].resolve()}'\n")
+
         out = RECORDING_DIR / f"{output_name}.mp4"
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-               "-i", str(concat_file),
-               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "10", str(out)]
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_file),
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-r", "10",
+            str(out),
+        ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode == 0:
@@ -194,7 +181,7 @@ class ScreenRecorder:
             return None
 
 # ── 等待 URL 关键字 ────────────────────────────────────────
-def wait_for_url(sb, keyword: str, timeout: int = 30) -> bool:
+def wait_for_url(sb, keyword: str, timeout: int = 20) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if keyword in sb.get_current_url():
@@ -202,77 +189,28 @@ def wait_for_url(sb, keyword: str, timeout: int = 30) -> bool:
         time.sleep(0.5)
     return False
 
-# ── 等待 Cloudflare 挑战页消失 ────────────────────────────
-def wait_past_cloudflare(sb, timeout: int = 30):
-    """
-    如果当前页面是 Cloudflare 挑战页（标题含 'Just a moment' / 'Attention Required'），
-    等待其自动通过。UC 模式下 SeleniumBase 会自动处理 Cloudflare。
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        title = sb.get_title() or ""
-        if "just a moment" in title.lower() or "attention required" in title.lower():
-            log(f"  等待 Cloudflare 挑战通过... ({title})")
-            time.sleep(2)
-        else:
-            return
-    warn("Cloudflare 挑战等待超时，继续执行...")
-
-# ── 检测是否已登录 ─────────────────────────────────────────
-def is_logged_in(sb) -> bool:
-    """
-    访问 dashboard，若未被重定向到 /login 则视为 Cookie 仍有效。
-    """
-    try:
-        sb.uc_open_with_reconnect(f"{BASE_URL}/dashboard", reconnect_time=4)
-        time.sleep(4)
-        wait_past_cloudflare(sb, timeout=20)
-        cur = sb.get_current_url()
-        log(f"  Cookie 检测当前 URL: {cur}")
-        # 只要跳到了 dashboard（不含 /login），视为已登录
-        if "ouipanel.com" in cur and "/login" not in cur:
-            return True
-    except Exception as e:
-        warn(f"检测登录状态异常: {e}")
-    return False
-
-# ── 执行账号密码登录 ───────────────────────────────────────
-def do_login(sb):
-    """
-    完整 OuiHeberg OAuth 流程：
-      1. 打开 OuiPanel /login
-      2. 点击「Connexion avec OuiHeberg.com」
-      3. 等待跳转到 manager.ouiheberg.com（OAuth 授权页）
-      4. 填写邮箱 + 密码，等待 Cloudflare，提交
-      5. 等待 OAuth 回调完成，跳回 ouipanel.com/dashboard
-    """
+# ── 登录 OuiHeberg OAuth ──────────────────────────────────
+def login(sb):
     log("打开 OuiPanel 登录页...")
-    sb.uc_open_with_reconnect(f"{BASE_URL}/login", reconnect_time=4)
+    sb.uc_open_with_reconnect(f"{BASE_URL}/login", reconnect_time=3)
     time.sleep(3)
-    wait_past_cloudflare(sb)
 
-    cur = sb.get_current_url()
-    log(f"  登录页 URL: {cur}")
-
-    # 若已经在 dashboard，直接返回
-    if "ouipanel.com" in cur and "/login" not in cur:
-        log("已在 dashboard，跳过登录")
+    if "dash.ouipanel.com" in sb.get_current_url() and "/login" not in sb.get_current_url():
+        log("已登录，跳过")
         return
 
-    # ── Step 1: 点击 OAuth 按钮 ───────────────────────────
-    log("点击 OuiHeberg OAuth 按钮...")
+    log("点击 OuiHeberg 登录按钮...")
     clicked = False
     for sel in [
         'button:contains("OuiHeberg")',
         'a:contains("OuiHeberg")',
         'button:contains("Connexion")',
-        'a:contains("Connexion")',
     ]:
         try:
             if sb.is_element_visible(sel):
                 sb.uc_click(sel)
                 clicked = True
-                log(f"  已点击: {sel}")
+                log(f"已点击: {sel}")
                 break
         except Exception:
             continue
@@ -291,155 +229,65 @@ def do_login(sb):
         """)
         if "not_found" not in str(r):
             clicked = True
-            log(f"  JS 点击: {r}")
+            log(f"JS 点击: {r}")
 
     if not clicked:
-        snap(sb, "ERR-login-btn-not-found")
+        snap(sb, "login-btn-not-found")
         raise RuntimeError("未找到 OuiHeberg 登录按钮")
 
-    # ── Step 2: 等待跳转到 OAuth 页 ───────────────────────
-    log(f"等待跳转到 OAuth 页 ({OAUTH_DOMAIN})...")
-    if not wait_for_url(sb, OAUTH_DOMAIN, timeout=20):
-        snap(sb, "ERR-oauth-redirect-failed")
+    if not wait_for_url(sb, "manager.ouiheberg.com", timeout=15):
+        snap(sb, "oauth-redirect-failed")
         raise RuntimeError(f"未跳转到 OAuth 页，当前: {sb.get_current_url()}")
 
-    log(f"  OAuth URL: {sb.get_current_url()}")
-    time.sleep(3)
-    # OAuth 页也可能有 Cloudflare
-    wait_past_cloudflare(sb, timeout=30)
-    snap(sb, "02-oauth-page")
+    log("填写邮箱和密码...")
+    time.sleep(2)
 
-    # ── Step 3: 填写邮箱 ──────────────────────────────────
-    log(f"填写邮箱: {mask(EMAIL)} ...")
-    _fill_input(sb, 'input[type="email"], input[name="email"], #email', EMAIL)
+    try:
+        sb.type('input[type="email"], input[name="email"], #email', EMAIL)
+    except Exception:
+        sb.execute_script(
+            "var i=document.querySelector('input[type=\"email\"],input[name=\"email\"],#email');"
+            f"if(i){{i.value='{EMAIL}';i.dispatchEvent(new Event('input'));}}"
+        )
     time.sleep(0.5)
 
-    # ── Step 4: 填写密码 ──────────────────────────────────
-    log("填写密码...")
-    _fill_input(sb, 'input[type="password"], input[name="password"], #password', PASSWORD)
+    try:
+        sb.type('input[type="password"], input[name="password"], #password', PASSWORD)
+    except Exception:
+        sb.execute_script(
+            "var i=document.querySelector('input[type=\"password\"],input[name=\"password\"],#password');"
+            f"if(i){{i.value='{PASSWORD}';i.dispatchEvent(new Event('input'));}}"
+        )
     time.sleep(0.5)
-    snap(sb, "03-credentials-filled")
 
-    # ── Step 5: 提交 ──────────────────────────────────────
     log("提交登录表单...")
-    submitted = False
-    for sel in ['button:contains("Connexion")', 'button[type="submit"]', 'input[type="submit"]']:
+    for sel in ['button:contains("Connexion")', 'button[type="submit"]']:
         try:
             if sb.is_element_visible(sel):
                 sb.uc_click(sel)
-                submitted = True
-                log(f"  已点击提交: {sel}")
                 break
         except Exception:
             continue
-
-    if not submitted:
+    else:
         sb.execute_script(
             "var b=document.querySelector('button[type=\"submit\"],input[type=\"submit\"]');"
             "if(b)b.click();"
         )
-        submitted = True
 
-    snap(sb, "04-form-submitted")
-
-    # ── Step 6: 等待 OAuth 回调完成跳回 ouipanel ──────────
-    log("等待 OAuth 回调，跳回 ouipanel.com/dashboard（最多 40 秒）...")
-    deadline = time.time() + 40
-    success = False
-    while time.time() < deadline:
-        cur = sb.get_current_url()
-        title = sb.get_title() or ""
-
-        # Cloudflare 挑战中，继续等
-        if "just a moment" in title.lower() or "attention required" in title.lower():
-            log(f"  Cloudflare 挑战中，等待... ({title})")
-            time.sleep(2)
-            continue
-
-        # 还在 OAuth 域，等待提交处理
-        if OAUTH_DOMAIN in cur:
-            # 检查是否有错误提示
-            err_text = sb.execute_script("""
-                var els = document.querySelectorAll('.alert, .error, .text-danger, [role="alert"]');
-                for(var i=0;i<els.length;i++){
-                    var t=(els[i].innerText||'').trim();
-                    if(t) return t;
-                }
-                return '';
-            """) or ""
-            if err_text:
-                snap(sb, "ERR-login-error")
-                raise RuntimeError(f"OAuth 登录错误: {err_text[:100]}")
-            time.sleep(1)
-            continue
-
-        # 跳回了 ouipanel.com
-        if "ouipanel.com" in cur:
-            if "/login" not in cur:
-                success = True
-                break
-            else:
-                # 还在 /login，说明 OAuth 回调后又回到了登录页（授权失败）
-                log(f"  回到 ouipanel /login，等待继续跳转... ({cur})")
-                time.sleep(2)
-                continue
-
-        time.sleep(0.5)
-
-    snap(sb, "05-after-oauth")
-
-    if not success:
-        cur = sb.get_current_url()
-        raise RuntimeError(
-            f"OAuth 登录失败：40秒内未跳转到 dashboard。当前: {cur}"
-        )
+    if not wait_for_url(sb, "ouipanel.com", timeout=20):
+        snap(sb, "login-failed")
+        raise RuntimeError(f"登录失败，当前: {sb.get_current_url()}")
 
     log(f"✅ 登录成功！当前: {sb.get_current_url()}")
-    snap(sb, "01-login-ok")
-
-def _fill_input(sb, selector: str, value: str):
-    """安全填写输入框，先尝试 type()，失败则用 JS。"""
-    try:
-        sb.type(selector, value)
-    except Exception:
-        escaped = value.replace("'", "\\'")
-        sb.execute_script(
-            f"var i=document.querySelector('{selector.split(',')[0].strip()}');"
-            f"if(i){{i.value='{escaped}';i.dispatchEvent(new Event('input',{{bubbles:true}}));}}"
-        )
-
-# ── 登录入口：Cookie 优先，失效则回退重新登录 ──────────────
-def login(sb):
-    """
-    Cookie 持久化登录策略：
-    1. 若 profile 存在，先检测 Cookie 是否有效（is_logged_in）
-    2. 有效 → 直接跳过；无效 / 首次 → do_login()
-    登录成功后浏览器 profile 自动保存 Cookie，下次复用。
-    """
-    log(f"📂 浏览器状态目录: {USER_DATA_DIR}")
-    profile_exists = Path(USER_DATA_DIR).exists()
-
-    if profile_exists:
-        log("🍪 检测已有 Cookie，尝试免登录...")
-        if is_logged_in(sb):
-            log("✅ Cookie 有效，已免登录")
-            snap(sb, "00-cookie-login-ok")
-            return
-        warn("⚠️  Cookie 已失效，回退账号密码登录...")
-    else:
-        log("🔑 首次运行，执行账号密码登录...")
-
-    do_login(sb)
+    snap(sb, "01-after-login")
 
 # ── 读取电源状态 ───────────────────────────────────────────
 def get_power_status(sb) -> str:
     console_url = f"{BASE_URL}/server/{SERVER_ID}/console"
-    log(f"打开控制台 (server={mask(SERVER_ID)})...")
-    sb.uc_open_with_reconnect(console_url, reconnect_time=3)
-    time.sleep(6)
-    wait_past_cloudflare(sb, timeout=20)
+    log(f"打开控制台: {console_url}")
+    sb.uc_open_with_reconnect(console_url, reconnect_time=2)
+    time.sleep(5)
 
-    # 关掉可能弹出的对话框
     sb.execute_script("""
         document.querySelectorAll('button').forEach(function(b){
             var t=(b.innerText||'').trim().toLowerCase();
@@ -447,16 +295,7 @@ def get_power_status(sb) -> str:
         });
     """)
     time.sleep(1)
-    snap(sb, "06-console")
-
-    # 如果被重定向回登录页，说明 session 在 console 页面也失效了
-    cur = sb.get_current_url()
-    if "/login" in cur:
-        warn("控制台页面跳到了登录页，session 已失效，重新登录...")
-        do_login(sb)
-        sb.uc_open_with_reconnect(console_url, reconnect_time=3)
-        time.sleep(6)
-        snap(sb, "06b-console-after-relogin")
+    snap(sb, "02-console")
 
     status = sb.execute_script("""
         var btns = document.querySelectorAll('button');
@@ -500,7 +339,7 @@ def start_server(sb) -> bool:
         log(f"JS Start: {r}")
         return True
 
-    snap(sb, "ERR-start-btn-not-found")
+    snap(sb, "start-btn-not-found")
     warn("未找到 Start 按钮")
     return False
 
@@ -515,7 +354,7 @@ def run():
         log("✅ Uptime Kuma 状态 UP，服务器已恢复，退出")
         return
 
-    log(f"▶ 检查服务器 [{mask(SERVER_ID)}]  账号: {mask(EMAIL)}")
+    log(f"▶ 检查服务器 [{SERVER_ID}]")
     if ENABLE_RECORDING:
         log("🎬 录屏已启用")
     else:
@@ -525,7 +364,6 @@ def run():
         uc=True,
         headless=False,
         undetectable=True,
-        user_data_dir=USER_DATA_DIR,          # Cookie 持久化
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     )
 
@@ -550,11 +388,11 @@ def run():
                 ok = start_server(sb)
                 if not ok:
                     notify("❌ OuiHeberg 启动失败",
-                           "服务器离线，但未找到 Start 按钮，请手动处理。")
+                           f"服务器 {SERVER_ID} 离线，但未找到 Start 按钮，请手动处理。")
                     return
 
                 time.sleep(5)
-                snap(sb, "07-after-start")
+                snap(sb, "03-after-start")
 
                 # 轮询确认上线（最多 3 分钟）
                 final = "unknown"
@@ -575,11 +413,11 @@ def run():
                     if final == "running":
                         break
 
-                snap(sb, "08-final")
+                snap(sb, "04-final")
                 if final == "running":
                     log("✅ 服务器已上线")
                     notify("🚀 OuiHeberg 服务器已上线",
-                           "检测到离线，已自动执行 Start，现已 ONLINE。")
+                           f"服务器 {SERVER_ID} 检测到离线，已自动执行 Start，现已 ONLINE。")
                 else:
                     log(f"⚠️ 启动后状态为 {final}，请手动确认")
                     notify("⚠️ OuiHeberg 服务器启动中",
@@ -588,7 +426,7 @@ def run():
         except Exception as e:
             err(f"异常: {e}")
             traceback.print_exc()
-            snap(sb, "ERR-exception")
+            snap(sb, "error")
             notify("❌ OuiHeberg 监控脚本异常", str(e))
             recorder.stop("run-error")
             sys.exit(1)
