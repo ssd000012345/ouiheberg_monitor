@@ -23,6 +23,9 @@ jobs:
     name: 检测状态并启动服务器
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: write   
+      contents: read
 
     steps:
       - name: 拉取仓库
