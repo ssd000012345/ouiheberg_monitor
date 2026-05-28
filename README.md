@@ -134,36 +134,61 @@ https://dash.ouipanel.com/server/{SERVER_ID}/console
 
 ### 2. 配置 Uptime Kuma Webhook
 
-在 Uptime Kuma 的 **通知（Notifications）** 设置中，添加一个新的通知渠道：
+> Uptime Kuma 是开源监控工具，需要部署在独立服务器上（推荐 Oracle Cloud 永久免费 VPS）。
 
-- **通知类型**：选择 `GitHub Actions Event`（或使用 Custom HTTP Webhook）
-- **Webhook URL**：
-  ```
-  https://api.github.com/repos/{你的GitHub用户名}/{仓库名}/dispatches
-  ```
-- **HTTP Method**：`POST`
-- **Headers**：
-  ```json
-  {
-    "Accept": "application/vnd.github.everest-preview+json",
-    "Authorization": "token {你的GitHub Personal Access Token}",
-    "Content-Type": "application/json"
+#### 获取 GitHub Personal Access Token
+
+1. 打开 [github.com/settings/tokens](https://github.com/settings/tokens) → **Generate new token (classic)**
+2. 勾选 **`repo`** 权限（包含 Actions 写权限）
+3. 生成并复制 Token（只显示一次）
+
+#### 配置 Webhook 通知
+
+**Settings → Notifications → Add Notification：**
+
+| 字段 | 填写内容 |
+|------|---------|
+| 通知类型 | `Webhook` |
+| 显示名称 | `GitHub Actions 紧急启动` |
+| Post URL | `https://api.github.com/repos/你的用户名/ouiheberg_monitor/dispatches` |
+| 请求体 | 选 `自定义内容` |
+
+**请求体内容：**
+```json
+{
+  "event_type": "server-down",
+  "client_payload": {
+    "reason": "Uptime Kuma alert",
+    "heartbeat": "{{heartbeatJSON}}"
   }
-  ```
-- **Body**：
-  ```json
-  {
-    "event_type": "server-down",
-    "client_payload": {
-      "status": "down",
-      "reason": "Uptime Kuma detected offline"
-    }
-  }
-  ```
+}
+```
 
-> **注意**：GitHub Personal Access Token 需要具有 `repo` 权限（或最低 `workflow` 权限）。
+**打开「额外 Header」开关，填入：**
+```json
+{
+  "Authorization": "Bearer github_pat_你的token",
+  "Accept": "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28"
+}
+```
 
-将此通知渠道绑定到对应的监控项，并设置 **仅在状态变为 Down 时触发**。
+点 **测试**，去 GitHub Actions 页面确认出现新的运行记录。
+
+#### 配置服务器监控项
+
+**Add New Monitor：**
+
+| 字段 | 填写内容 |
+|------|---------|
+| 监控类型 | `TCP Port` |
+| 显示名称 | `OuiHeberg 监控` |
+| 主机名 | 你的服务器地址（在 OuiPanel 控制台查看） |
+| 端口 | 你的服务器实际端口 |
+| 心跳间隔 | `60`（秒） |
+| 重试次数 | `2` |
+| 连续失败时重复发送通知的间隔次数 | `9999`（防止重复触发） |
+| 通知 | 选刚配置的 `GitHub Actions 紧急启动` |
 
 ---
 
